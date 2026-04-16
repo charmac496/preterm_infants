@@ -1,24 +1,17 @@
-library(readxl)
-library(tidyverse)          
+library(dplyr)
+library(tidyr)
+library(stringr)
+library(purrr)
+library(ggplot2)
 library(glmnet)
-library(cluster)
-library(dtw)
-library(labelled)
-library(forestploter)
-library(gtsummary)
-library(ordinalNet)
-library(MASS)
-library(conflicted)
+library(cluster)   
+library(dtw)             
+library(ordinalNet)     
+library(MASS)          
 library(mediation)
-library(broom)
+library(gtsummary) 
 library(flextable)
-library(lubridate)
-
-conflict_prefer("select", "dplyr")
-conflict_prefer("lag", "dplyr")
-conflict_prefer("as.matrix", "base")
-conflict_prefer("as.dist", "stats")
-conflict_prefer("filter", "dplyr")
+library(forcats)
 
 #' Rename columns in a dataframe using a mapping vector
 #'
@@ -43,7 +36,7 @@ renames <- function(df, old_names, new_names) {
   for (i in seq_along(old_names)) {
     # Only rename if the old column name exists in the dataframe
     if (old_names[i] %in% colnames(df)) {
-      df <- df %>% rename(!!new_names[i] := !!sym(old_names[i]))
+      df <- df %>% dplyr::rename(!!new_names[i] := !!sym(old_names[i]))
     }
   }
   return(df)
@@ -368,7 +361,7 @@ cluster_by_dtw <- function(data, var_name, optimal_k = NULL,
   # Convert to wide format: each subject becomes a row, time points become columns
   # Column names are set to the values in `time_col` (assumed numeric or coercible)
   data_wide <- data %>%
-    select(!!sym(id_col), !!sym(time_col), all_of(var_name)) %>%
+    dplyr::select(!!sym(id_col), !!sym(time_col), all_of(var_name)) %>%
     pivot_wider(
       id_cols = !!sym(id_col),
       names_from = !!sym(time_col),
@@ -421,6 +414,206 @@ cluster_by_dtw <- function(data, var_name, optimal_k = NULL,
     data_wide[[cluster_col_name]] <- factor(clusters)
     return(data_wide)
   }
+}
+
+#' Plot time series trajectories for a cluster with median and IQR ribbon
+#'
+#' This function creates a ggplot of individual trajectories (semi-transparent lines)
+#' for a single cluster, overlaid with the median line and an interquartile range ribbon.
+#' It is designed to visualize clustering results for longitudinal data.
+#' Ordered factor response variables are automatically converted to numeric for plotting,
+#' while preserving the original factor levels for axis labels.
+#'
+#' @param data Data frame containing individual observations (long format).
+#' @param stats Data frame containing cluster-level summary statistics (median, Q25, Q75)
+#'        for each time point within a cluster.
+#' @param cluster_id Value identifying the cluster to plot (must exist in both `data` and `stats`).
+#' @param cluster_col Character string naming the cluster column in both `data` and `stats`.
+#' @param id_col Character string naming the individual identifier column in `data`.
+#' @param time_col Character string naming the time column (numeric) in both `data` and `stats`.
+#' @param value_col Character string naming the observed value column in `data` (can be numeric or ordered factor).
+#' @param median_col Character string naming the median column in `stats` (numeric or ordered factor).
+#' @param q25_col Character string naming the first quartile column in `stats` (numeric or ordered factor).
+#' @param q75_col Character string naming the third quartile column in `stats` (numeric or ordered factor).
+#' @param cluster_labels Optional named character vector or function. If a named vector,
+#'        names should be cluster values (as characters) and values the desired labels.
+#'        If a function, it will be applied to `cluster_id` to generate the title.
+#'        Default `NULL` uses the raw cluster value as title.
+#' @param individual_alpha Transparency for individual lines (0-1). Default 0.4.
+#' @param individual_linewidth Width of individual lines. Default 0.5.
+#' @param individual_color Color for individual lines. Default "gray60".
+#' @param median_color Color for the median line. Default "red".
+#' @param median_linewidth Width of the median line. Default 1.5.
+#' @param ribbon_fill Fill color for the IQR ribbon. Default "blue".
+#' @param ribbon_alpha Transparency for the ribbon fill. Default 0.2.
+#' @param xlab Label for x-axis. Default `time_col`.
+#' @param ylab Label for y-axis. Default `value_col`.
+#' @param x_breaks Optional numeric vector of breaks for x-axis.
+#' @param x_minor_breaks Optional numeric vector of minor breaks for x-axis.
+#' @param ... Additional arguments passed to `labs()` (e.g., `caption`, `subtitle`).
+#'
+#' @return A `ggplot` object.
+#' @importFrom ggplot2 ggplot aes geom_line geom_ribbon labs theme element_text scale_x_continuous scale_y_continuous
+#' @export
+plot_cluster_trajectories <- function(data,
+                                      stats,
+                                      cluster_id,
+                                      cluster_col,
+                                      id_col,
+                                      time_col,
+                                      value_col,
+                                      median_col,
+                                      q25_col,
+                                      q75_col,
+                                      cluster_labels = NULL,
+                                      individual_alpha = 0.4,
+                                      individual_linewidth = 0.5,
+                                      individual_color = "gray60",
+                                      median_color = "red",
+                                      median_linewidth = 1.5,
+                                      ribbon_fill = "blue",
+                                      ribbon_alpha = 0.2,
+                                      xlab = NULL,
+                                      ylab = NULL,
+                                      x_breaks = NULL,
+                                      x_minor_breaks = NULL,
+                                      ...) {
+  
+  # Validate required columns in data and stats
+  required_cols_data <- c(id_col, time_col, value_col, cluster_col)
+  required_cols_stats <- c(cluster_col, time_col, median_col, q25_col, q75_col)
+  for (col in required_cols_data) {
+    if (!col %in% names(data)) stop("Column '", col, "' not found in `data`.")
+  }
+  for (col in required_cols_stats) {
+    if (!col %in% names(stats)) stop("Column '", col, "' not found in `stats`.")
+  }
+  
+  # Filter data for the requested cluster
+  cluster_data <- data[data[[cluster_col]] == cluster_id, ]
+  if (nrow(cluster_data) == 0) stop("No observations in `data` for cluster_id = ", cluster_id)
+  cluster_stats <- stats[stats[[cluster_col]] == cluster_id, ]
+  if (nrow(cluster_stats) == 0) stop("No observations in `stats` for cluster_id = ", cluster_id)
+  
+  # Convert ordered factor to numeric for proper plotting, store levels for axis labels
+  y_levels <- NULL
+  if (is.factor(cluster_data[[value_col]])) {
+    y_levels <- levels(cluster_data[[value_col]])
+    cluster_data[[value_col]] <- as.numeric(cluster_data[[value_col]])
+    warning("Converted factor `", value_col, "` to numeric for plotting. Labels: ", paste(y_levels, collapse = ", "))
+  }
+  
+  for (col in c(median_col, q25_col, q75_col)) {
+    if (is.factor(cluster_stats[[col]])) {
+      cluster_stats[[col]] <- as.numeric(cluster_stats[[col]])
+    }
+  }
+  
+  # Ensure time column is numeric
+  if (!is.numeric(cluster_data[[time_col]])) {
+    cluster_data[[time_col]] <- as.numeric(cluster_data[[time_col]])
+  }
+  if (!is.numeric(cluster_stats[[time_col]])) {
+    cluster_stats[[time_col]] <- as.numeric(cluster_stats[[time_col]])
+  }
+  
+  # Determine plot title
+  if (is.null(cluster_labels)) {
+    title <- as.character(cluster_id)
+  } else if (is.function(cluster_labels)) {
+    title <- cluster_labels(cluster_id)
+  } else {
+    id_char <- as.character(cluster_id)
+    title <- ifelse(id_char %in% names(cluster_labels), cluster_labels[id_char], id_char)
+  }
+  
+  # Default axis labels
+  if (is.null(xlab)) xlab <- time_col
+  if (is.null(ylab)) ylab <- if (!is.null(y_levels)) paste0(value_col, " (numeric level)") else value_col
+  
+  # Build the plot
+  p <- ggplot() +
+    geom_line(data = cluster_data,
+              aes(x = .data[[time_col]], y = .data[[value_col]], group = .data[[id_col]]),
+              alpha = individual_alpha, linewidth = individual_linewidth, color = individual_color) +
+    geom_line(data = cluster_stats,
+              aes(x = .data[[time_col]], y = .data[[median_col]]),
+              color = median_color, linewidth = median_linewidth) +
+    geom_ribbon(data = cluster_stats,
+                aes(x = .data[[time_col]], ymin = .data[[q25_col]], ymax = .data[[q75_col]]),
+                fill = ribbon_fill, alpha = ribbon_alpha) +
+    labs(title = title, x = xlab, y = ylab, ...) +
+    theme(plot.title = element_text(hjust = 0.5))
+  
+  # If original response was a factor, relabel y-axis with original levels
+  if (!is.null(y_levels)) {
+    p <- p + scale_y_continuous(breaks = seq_along(y_levels), labels = y_levels)
+  }
+  
+  # Customize x-axis breaks if provided
+  if (!is.null(x_breaks) || !is.null(x_minor_breaks)) {
+    p <- p + scale_x_continuous(breaks = x_breaks, minor_breaks = x_minor_breaks)
+  }
+  
+  return(p)
+}
+
+
+#' Generate and combine cluster trajectory plots for all clusters
+#'
+#' A convenience wrapper around `plot_cluster_trajectories` that creates a plot
+#' for each unique cluster in the data and optionally arranges them using `patchwork`.
+#'
+#' @param data Same as in `plot_cluster_trajectories`.
+#' @param stats Same as in `plot_cluster_trajectories`.
+#' @param cluster_col Same as in `plot_cluster_trajectories`.
+#' @param ... All other arguments passed to `plot_cluster_trajectories` (e.g.,
+#'        `id_col`, `time_col`, `value_col`, `median_col`, `q25_col`, `q75_col`,
+#'        `cluster_labels`, styling parameters).
+#' @param combine Logical; if `TRUE`, combine plots using `patchwork::wrap_plots()`.
+#'        Default `TRUE`. Requires `patchwork` package.
+#' @param ncol Number of columns for combined plots (ignored if `combine = FALSE`).
+#' @param nrow Number of rows for combined plots (ignored if `combine = FALSE`).
+#' @param title Optional overall title for the combined plot.
+#'
+#' @return If `combine = TRUE` and `patchwork` is available, a combined `ggplot`
+#'         object; otherwise, a list of `ggplot` objects (one per cluster).
+#' @export
+plot_all_clusters <- function(data,
+                              stats,
+                              cluster_col,
+                              ...,
+                              combine = TRUE,
+                              ncol = NULL,
+                              nrow = NULL,
+                              title = NULL) {
+  
+  clusters <- unique(c(data[[cluster_col]], stats[[cluster_col]]))
+  clusters <- sort(clusters[!is.na(clusters)])
+  
+  plots <- lapply(clusters, function(cl) {
+    plot_cluster_trajectories(data = data,
+                              stats = stats,
+                              cluster_id = cl,
+                              cluster_col = cluster_col,
+                              ...)
+  })
+  
+  if (!combine) {
+    return(plots)
+  }
+  
+  if (!requireNamespace("patchwork", quietly = TRUE)) {
+    warning("Package 'patchwork' is needed for combining plots. Returning list of plots instead.")
+    return(plots)
+  }
+  
+  combined <- patchwork::wrap_plots(plots, ncol = ncol, nrow = nrow)
+  if (!is.null(title)) {
+    combined <- combined + patchwork::plot_annotation(title = title,
+                                                      theme = ggplot2::theme(plot.title = ggplot2::element_text(hjust = 0.5)))
+  }
+  return(combined)
 }
 
 #' Merge multiple dataframes dynamically based on group membership
@@ -878,6 +1071,205 @@ uni_test <- function(df, iv, dv, threshold = 0.05) {
   out <- list(all = all_results, significant = sig_results)
   if (length(error_log) > 0) out$errors <- error_log
   return(out)
+}
+
+#' Merge multiple univariate analysis result dataframes into a publication-ready table
+#'
+#' @param result_list A named list of dataframes, each containing univariate results for one outcome.
+#' @param id_col Character, name of the column containing variable names. Default "IV".
+#' @param p_col Character, name of the column containing p-values. Default "p.value".
+#' @param method_col Character, name of the column containing test method names. Default "method".
+#' @param p_thresholds Numeric vector of p-value cutoffs (any order, will be sorted ascending).
+#'   Default c(0.1, 0.05, 0.01, 0.001).
+#' @param p_symbols Character vector of significance symbols, same length as p_thresholds.
+#'   Will be reordered to match the ascending sorted thresholds.
+#'   Default c(".", "*", "**", "***").
+#' @param color_palette Character vector of colors. Must have length = length(p_thresholds) + 2.
+#'   Default: c("grey50", "black", "orange", "red", "darkred", "purple").
+#' @param method_abbr Named character vector for abbreviating test methods.
+#' @param digits Integer, number of decimal places for p-values. Default 3.
+#' @param na_display Character to display for missing values. Default "\u2014" (em dash).
+#' @param iv_labels Named character vector for renaming independent variables (rows).
+#' @param dv_labels Named character vector for renaming dependent variables / outcomes (columns).
+#' @param output_format One of "flextable", "gt", or "kable".
+#'
+#' @return A table object of the specified format.
+#' @export
+univariate_table <- function(
+    result_list,
+    id_col = "IV",
+    p_col = "p.value",
+    method_col = "method",
+    p_thresholds = c(0.1, 0.05, 0.01, 0.001),
+    p_symbols = c(".", "*", "**", "***"),
+    color_palette = c("grey50", "black", "orange", "red", "darkred", "purple"),
+    method_abbr = c(
+      "t.test" = "t",
+      "wilcox.test" = "Wilcoxon",
+      "fisher.test" = "Fisher",
+      "kruskal.test" = "Kruskal",
+      "spearman" = "Spearman"
+    ),
+    digits = 3,
+    na_display = "\u2014",
+    iv_labels = NULL,
+    dv_labels = NULL,
+    output_format = c("flextable", "gt", "kable")
+) {
+  
+  output_format <- match.arg(output_format)
+  
+  # --- Input validation ---
+  if (length(p_thresholds) != length(p_symbols)) {
+    stop("p_thresholds and p_symbols must have the same length.")
+  }
+  if (length(color_palette) != length(p_thresholds) + 2) {
+    stop("color_palette must have length = length(p_thresholds) + 2.")
+  }
+  
+  # --- Sort thresholds ascending (smallest first) and align symbols ---
+  ord <- order(p_thresholds, decreasing = FALSE)
+  p_thresholds <- p_thresholds[ord]
+  p_symbols <- p_symbols[ord]
+  n_thresh <- length(p_thresholds)
+  
+  # --- 1. Combine all dataframes into long format ---
+  long_df <- dplyr::bind_rows(result_list, .id = "Outcome") %>%
+    dplyr::select(dplyr::all_of(c("Outcome", id_col, p_col, method_col)))
+  
+  # --- 2. Create p-value matrix and method matrix (wide format) ---
+  p_mat <- long_df %>%
+    dplyr::select(-dplyr::all_of(method_col)) %>%
+    tidyr::pivot_wider(names_from = "Outcome", values_from = dplyr::all_of(p_col))
+  
+  method_mat <- long_df %>%
+    dplyr::select(-dplyr::all_of(p_col)) %>%
+    tidyr::pivot_wider(names_from = "Outcome", values_from = dplyr::all_of(method_col))
+  
+  features <- p_mat[[id_col]]
+  p_mat <- as.data.frame(p_mat[, -1, drop = FALSE])
+  rownames(p_mat) <- features
+  
+  method_mat <- as.data.frame(method_mat[, -1, drop = FALSE])
+  rownames(method_mat) <- features
+  
+  common_cols <- intersect(colnames(p_mat), colnames(method_mat))
+  p_mat <- p_mat[, common_cols, drop = FALSE]
+  method_mat <- method_mat[, common_cols, drop = FALSE]
+  
+  # --- Apply IV and DV renaming ---
+  if (!is.null(iv_labels)) {
+    new_rownames <- rownames(p_mat)
+    matched <- match(new_rownames, names(iv_labels))
+    new_rownames[!is.na(matched)] <- iv_labels[matched[!is.na(matched)]]
+    rownames(p_mat) <- new_rownames
+    rownames(method_mat) <- new_rownames
+  }
+  
+  if (!is.null(dv_labels)) {
+    new_colnames <- colnames(p_mat)
+    matched <- match(new_colnames, names(dv_labels))
+    new_colnames[!is.na(matched)] <- dv_labels[matched[!is.na(matched)]]
+    colnames(p_mat) <- new_colnames
+    colnames(method_mat) <- new_colnames
+  }
+  
+  # --- 3. Helper: assign significance symbol based on p-value ---
+  get_symbol <- function(p) {
+    if (is.na(p)) return("")
+    for (i in seq_along(p_thresholds)) {
+      if (p <= p_thresholds[i]) return(p_symbols[i])
+    }
+    return("")
+  }
+  
+  # --- 4. Helper: abbreviate test method ---
+  abbr_method <- function(m) {
+    if (is.na(m)) return(na_display)
+    abbr <- method_abbr[m]
+    if (is.na(abbr)) m else abbr
+  }
+  
+  # --- 5. Build cell text matrix (display content) ---
+  cell_text <- matrix(na_display, nrow = nrow(p_mat), ncol = ncol(p_mat))
+  for (i in seq_len(nrow(p_mat))) {
+    for (j in seq_len(ncol(p_mat))) {
+      p <- p_mat[i, j]
+      m <- method_mat[i, j]
+      if (is.na(p) || is.na(m)) next
+      sym <- get_symbol(p)
+      p_fmt <- formatC(p, format = "f", digits = digits)
+      cell_text[i, j] <- sprintf("%s: %s%s", abbr_method(m), p_fmt, sym)
+    }
+  }
+  rownames(cell_text) <- rownames(p_mat)
+  colnames(cell_text) <- colnames(p_mat)
+  
+  # --- 6. Color assignment based on p-value ---
+  get_color <- function(p) {
+    if (is.na(p)) return(color_palette[1])
+    idx <- findInterval(p, p_thresholds, rightmost.closed = FALSE)
+    if (idx == n_thresh) {
+      return(color_palette[2])                     # non-significant
+    } else if (idx == 0) {
+      return(color_palette[length(color_palette)]) # most significant
+    } else {
+      return(color_palette[2 + idx])
+    }
+  }
+  
+  # --- 7. Generate output table ---
+  if (output_format == "flextable") {
+    tbl_df <- as.data.frame(cell_text, stringsAsFactors = FALSE)
+    tbl_df <- cbind(Variable = rownames(tbl_df), tbl_df)
+    ft <- flextable::flextable(tbl_df) %>%
+      flextable::theme_vanilla() %>%
+      flextable::align(j = 1, align = "left", part = "all") %>%
+      flextable::align(j = 2:ncol(tbl_df), align = "center", part = "all") %>%
+      flextable::bold(j = 1, part = "body") %>%
+      flextable::autofit()
+    
+    for (i in seq_len(nrow(p_mat))) {
+      for (j in seq_len(ncol(p_mat))) {
+        p_val <- p_mat[i, j]
+        clr <- get_color(p_val)
+        ft <- flextable::color(ft, i = i, j = j + 1, color = clr)
+      }
+    }
+    return(ft)
+    
+  } else if (output_format == "gt") {
+    if (!requireNamespace("gt", quietly = TRUE)) {
+      stop("Package 'gt' is required for output_format = 'gt'")
+    }
+    tbl_df <- as.data.frame(cell_text, stringsAsFactors = FALSE)
+    tbl_df <- cbind(Variable = rownames(tbl_df), tbl_df)
+    gt_tbl <- gt::gt(tbl_df, rowname_col = "Variable") %>%
+      gt::tab_style(
+        style = gt::cell_text(align = "left"),
+        locations = gt::cells_stub()
+      ) %>%
+      gt::cols_align(align = "center", columns = dplyr::everything())
+    warning("Color styling not fully implemented for gt output. Use flextable for full features.")
+    return(gt_tbl)
+    
+  } else if (output_format == "kable") {
+    if (!requireNamespace("kableExtra", quietly = TRUE)) {
+      stop("Package 'kableExtra' is required for output_format = 'kable'")
+    }
+    tbl_df <- as.data.frame(cell_text, stringsAsFactors = FALSE)
+    tbl_df <- cbind(Variable = rownames(tbl_df), tbl_df)
+    kbl <- kableExtra::kbl(tbl_df, format = "html", align = "c") %>%
+      kableExtra::kable_styling(bootstrap_options = c("striped", "hover"))
+    for (i in seq_len(nrow(p_mat))) {
+      for (j in seq_len(ncol(p_mat))) {
+        p_val <- p_mat[i, j]
+        clr <- get_color(p_val)
+        kbl <- kableExtra::row_spec(kbl, i, color = clr, column = j + 1)
+      }
+    }
+    return(kbl)
+  }
 }
 
 #' Generate robust starting values for ordinal logistic regression
@@ -1669,8 +2061,8 @@ make_tbl_list <- function(model_list,
   reordered_list <- map(tbl_list, function(tbl) {
     tbl_data <- tbl$table_body
     var_pvals <- tbl_data %>%
-      filter(row_type == "label") %>%
-      select(variable, p.value) %>%
+      dplyr::filter(row_type == "label") %>%
+      dplyr::select(variable, p.value) %>%
       distinct()
     
     # Check existence of keep_var in this model if requested
@@ -1691,7 +2083,7 @@ make_tbl_list <- function(model_list,
     
     # Reorder the table body rows according to the new variable order
     reordered_data <- map_dfr(ordered_vars, function(var) {
-      tbl_data %>% filter(variable == var)
+      tbl_data %>% dplyr::filter(variable == var)
     })
     tbl$table_body <- reordered_data
     tbl
@@ -1750,201 +2142,3 @@ stack_tables <- function(tbl_list,
   return(combined)
 }
 
-#' Merge multiple univariate analysis result dataframes into a publication-ready table
-#'
-#' @param result_list A named list of dataframes, each containing univariate results for one outcome.
-#' @param id_col Character, name of the column containing variable names. Default "IV".
-#' @param p_col Character, name of the column containing p-values. Default "p.value".
-#' @param method_col Character, name of the column containing test method names. Default "method".
-#' @param p_thresholds Numeric vector of p-value cutoffs (any order, will be sorted ascending).
-#'   Default c(0.1, 0.05, 0.01, 0.001).
-#' @param p_symbols Character vector of significance symbols, same length as p_thresholds.
-#'   Will be reordered to match the ascending sorted thresholds.
-#'   Default c(".", "*", "**", "***").
-#' @param color_palette Character vector of colors. Must have length = length(p_thresholds) + 2.
-#'   Default: c("grey50", "black", "orange", "red", "darkred", "purple").
-#' @param method_abbr Named character vector for abbreviating test methods.
-#' @param digits Integer, number of decimal places for p-values. Default 3.
-#' @param na_display Character to display for missing values. Default "\u2014" (em dash).
-#' @param iv_labels Named character vector for renaming independent variables (rows).
-#' @param dv_labels Named character vector for renaming dependent variables / outcomes (columns).
-#' @param output_format One of "flextable", "gt", or "kable".
-#'
-#' @return A table object of the specified format.
-#' @export
-univariate_table <- function(
-    result_list,
-    id_col = "IV",
-    p_col = "p.value",
-    method_col = "method",
-    p_thresholds = c(0.1, 0.05, 0.01, 0.001),
-    p_symbols = c(".", "*", "**", "***"),
-    color_palette = c("grey50", "black", "orange", "red", "darkred", "purple"),
-    method_abbr = c(
-      "t.test" = "t",
-      "wilcox.test" = "Wilcoxon",
-      "fisher.test" = "Fisher",
-      "kruskal.test" = "Kruskal",
-      "spearman" = "Spearman"
-    ),
-    digits = 3,
-    na_display = "\u2014",
-    iv_labels = NULL,
-    dv_labels = NULL,
-    output_format = c("flextable", "gt", "kable")
-) {
-  
-  output_format <- match.arg(output_format)
-  
-  # --- Input validation ---
-  if (length(p_thresholds) != length(p_symbols)) {
-    stop("p_thresholds and p_symbols must have the same length.")
-  }
-  if (length(color_palette) != length(p_thresholds) + 2) {
-    stop("color_palette must have length = length(p_thresholds) + 2.")
-  }
-  
-  # --- Sort thresholds ascending (smallest first) and align symbols ---
-  ord <- order(p_thresholds, decreasing = FALSE)
-  p_thresholds <- p_thresholds[ord]
-  p_symbols <- p_symbols[ord]
-  n_thresh <- length(p_thresholds)
-  
-  # --- 1. Combine all dataframes into long format ---
-  long_df <- dplyr::bind_rows(result_list, .id = "Outcome") %>%
-    dplyr::select(dplyr::all_of(c("Outcome", id_col, p_col, method_col)))
-  
-  # --- 2. Create p-value matrix and method matrix (wide format) ---
-  p_mat <- long_df %>%
-    dplyr::select(-dplyr::all_of(method_col)) %>%
-    tidyr::pivot_wider(names_from = "Outcome", values_from = dplyr::all_of(p_col))
-  
-  method_mat <- long_df %>%
-    dplyr::select(-dplyr::all_of(p_col)) %>%
-    tidyr::pivot_wider(names_from = "Outcome", values_from = dplyr::all_of(method_col))
-  
-  features <- p_mat[[id_col]]
-  p_mat <- as.data.frame(p_mat[, -1, drop = FALSE])
-  rownames(p_mat) <- features
-  
-  method_mat <- as.data.frame(method_mat[, -1, drop = FALSE])
-  rownames(method_mat) <- features
-  
-  common_cols <- intersect(colnames(p_mat), colnames(method_mat))
-  p_mat <- p_mat[, common_cols, drop = FALSE]
-  method_mat <- method_mat[, common_cols, drop = FALSE]
-  
-  # --- Apply IV and DV renaming ---
-  if (!is.null(iv_labels)) {
-    new_rownames <- rownames(p_mat)
-    matched <- match(new_rownames, names(iv_labels))
-    new_rownames[!is.na(matched)] <- iv_labels[matched[!is.na(matched)]]
-    rownames(p_mat) <- new_rownames
-    rownames(method_mat) <- new_rownames
-  }
-  
-  if (!is.null(dv_labels)) {
-    new_colnames <- colnames(p_mat)
-    matched <- match(new_colnames, names(dv_labels))
-    new_colnames[!is.na(matched)] <- dv_labels[matched[!is.na(matched)]]
-    colnames(p_mat) <- new_colnames
-    colnames(method_mat) <- new_colnames
-  }
-  
-  # --- 3. Helper: assign significance symbol based on p-value ---
-  get_symbol <- function(p) {
-    if (is.na(p)) return("")
-    for (i in seq_along(p_thresholds)) {
-      if (p <= p_thresholds[i]) return(p_symbols[i])
-    }
-    return("")
-  }
-  
-  # --- 4. Helper: abbreviate test method ---
-  abbr_method <- function(m) {
-    if (is.na(m)) return(na_display)
-    abbr <- method_abbr[m]
-    if (is.na(abbr)) m else abbr
-  }
-  
-  # --- 5. Build cell text matrix (display content) ---
-  cell_text <- matrix(na_display, nrow = nrow(p_mat), ncol = ncol(p_mat))
-  for (i in seq_len(nrow(p_mat))) {
-    for (j in seq_len(ncol(p_mat))) {
-      p <- p_mat[i, j]
-      m <- method_mat[i, j]
-      if (is.na(p) || is.na(m)) next
-      sym <- get_symbol(p)
-      p_fmt <- formatC(p, format = "f", digits = digits)
-      cell_text[i, j] <- sprintf("%s: %s%s", abbr_method(m), p_fmt, sym)
-    }
-  }
-  rownames(cell_text) <- rownames(p_mat)
-  colnames(cell_text) <- colnames(p_mat)
-  
-  # --- 6. Color assignment based on p-value ---
-  get_color <- function(p) {
-    if (is.na(p)) return(color_palette[1])
-    idx <- findInterval(p, p_thresholds, rightmost.closed = FALSE)
-    if (idx == n_thresh) {
-      return(color_palette[2])                     # non-significant
-    } else if (idx == 0) {
-      return(color_palette[length(color_palette)]) # most significant
-    } else {
-      return(color_palette[2 + idx])
-    }
-  }
-  
-  # --- 7. Generate output table ---
-  if (output_format == "flextable") {
-    tbl_df <- as.data.frame(cell_text, stringsAsFactors = FALSE)
-    tbl_df <- cbind(Variable = rownames(tbl_df), tbl_df)
-    ft <- flextable::flextable(tbl_df) %>%
-      flextable::theme_vanilla() %>%
-      flextable::align(j = 1, align = "left", part = "all") %>%
-      flextable::align(j = 2:ncol(tbl_df), align = "center", part = "all") %>%
-      flextable::bold(j = 1, part = "body") %>%
-      flextable::autofit()
-    
-    for (i in seq_len(nrow(p_mat))) {
-      for (j in seq_len(ncol(p_mat))) {
-        p_val <- p_mat[i, j]
-        clr <- get_color(p_val)
-        ft <- flextable::color(ft, i = i, j = j + 1, color = clr)
-      }
-    }
-    return(ft)
-    
-  } else if (output_format == "gt") {
-    if (!requireNamespace("gt", quietly = TRUE)) {
-      stop("Package 'gt' is required for output_format = 'gt'")
-    }
-    tbl_df <- as.data.frame(cell_text, stringsAsFactors = FALSE)
-    tbl_df <- cbind(Variable = rownames(tbl_df), tbl_df)
-    gt_tbl <- gt::gt(tbl_df, rowname_col = "Variable") %>%
-      gt::tab_style(
-        style = gt::cell_text(align = "left"),
-        locations = gt::cells_stub()
-      ) %>%
-      gt::cols_align(align = "center", columns = dplyr::everything())
-    warning("Color styling not fully implemented for gt output. Use flextable for full features.")
-    return(gt_tbl)
-    
-  } else if (output_format == "kable") {
-    if (!requireNamespace("kableExtra", quietly = TRUE)) {
-      stop("Package 'kableExtra' is required for output_format = 'kable'")
-    }
-    tbl_df <- as.data.frame(cell_text, stringsAsFactors = FALSE)
-    tbl_df <- cbind(Variable = rownames(tbl_df), tbl_df)
-    kbl <- kableExtra::kbl(tbl_df, format = "html", align = "c") %>%
-      kableExtra::kable_styling(bootstrap_options = c("striped", "hover"))
-    for (i in seq_len(nrow(p_mat))) {
-      for (j in seq_len(ncol(p_mat))) {
-        p_val <- p_mat[i, j]
-        clr <- get_color(p_val)
-        kbl <- kableExtra::row_spec(kbl, i, color = clr, column = j + 1)
-      }
-    }
-    return(kbl)
-  }
-}
